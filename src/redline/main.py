@@ -18,7 +18,8 @@ from redline.core.store import Store
 from redline.core.types import EquitySnapshot, RunRecord, RunStatus
 from redline.data.candles import close_prices
 from redline.data.providers.coinbase import CoinbaseDataProvider
-from redline.execution.policy import DryRunPolicy
+from redline.execution.errors import ExecutionHaltError
+from redline.execution.policy import DryRunPolicy, LiveExecutionPolicy
 from redline.logging import RunLogger
 from redline.monitoring.alerts import AlertManager
 from redline.sizing.risk_parity import compute_target_notionals, inverse_vol_weights
@@ -223,10 +224,62 @@ def cmd_run(args: argparse.Namespace, cfg: Config) -> None:
     planned = plan_orders(balances, target_notionals, prices, constraints, equity, cfg.min_trade_usd)
 
     # ------------------------------------------------------------------ #
-    # 7. Execute (dry-run: log only — no order submission)                 #
+    # 7. Execute                                                           #
     # ------------------------------------------------------------------ #
-    policy = DryRunPolicy(logger)
-    executed = policy.execute(planned)
+    submitted_orders_dicts: list[dict] = []
+
+    if dry_run:
+        policy = DryRunPolicy(logger)
+        executed = policy.execute(planned)
+    else:
+        live_policy = LiveExecutionPolicy(
+            store=store,
+            broker=broker,
+            run_id=run_id,
+            logger=logger,
+            timeout_s=60.0,
+        )
+        try:
+            executed = live_policy.execute(planned)
+            submitted_orders_dicts = [o.to_dict() for o in executed]
+        except ExecutionHaltError as exc:
+            logger.error("execution_halt", reason=exc.reason)
+            store.set_halt(exc.reason)
+            drawdown_halt = (peak_equity - equity) / peak_equity if peak_equity > 0 else 0.0
+            store.save_equity_snapshot(
+                EquitySnapshot(run_id=run_id, ts_utc=utcnow_iso(), equity_usd=equity)
+            )
+            store.save_run(
+                RunRecord(
+                    run_id=run_id,
+                    ts_utc=utcnow_iso(),
+                    status=RunStatus.HALTED,
+                    dry_run=dry_run,
+                    equity_usd=equity,
+                    peak_equity_usd=peak_equity,
+                    drawdown=drawdown_halt,
+                    halt_flag=True,
+                    halt_reason=exc.reason,
+                    skip_reason="halted",
+                    signals=signals,
+                    vols=vols,
+                    targets=target_notionals,
+                    planned_orders=[o.to_dict() for o in planned],
+                    submitted_orders=[],
+                    positions={k: v.available for k, v in balances.items()},
+                )
+            )
+            alerts.send_alert(
+                "HALT_TRIGGERED",
+                {
+                    "reason": exc.reason,
+                    "equity_usd": f"{equity:.2f}",
+                    "peak_equity_usd": f"{peak_equity:.2f}",
+                    "drawdown": f"{drawdown_halt:.2%}",
+                },
+                dry_run,
+            )
+            sys.exit(0)
 
     # ------------------------------------------------------------------ #
     # 8. Persist                                                           #
@@ -249,7 +302,8 @@ def cmd_run(args: argparse.Namespace, cfg: Config) -> None:
             signals=signals,
             vols=vols,
             targets=target_notionals,
-            planned_orders=[o.to_dict() for o in executed],
+            planned_orders=[o.to_dict() for o in planned],
+            submitted_orders=submitted_orders_dicts,
             positions={k: v.available for k, v in balances.items()},
         )
     )

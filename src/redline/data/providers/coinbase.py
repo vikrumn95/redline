@@ -1,16 +1,17 @@
-"""Coinbase Advanced Trade API data provider (candles, products, accounts)."""
+"""Coinbase Advanced Trade API data provider (candles, products, accounts, orders)."""
 from __future__ import annotations
 
 import math
 import random
 import secrets
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
 
-from redline.core.types import Balance, Candle, ProductConstraints
+from redline.core.types import Balance, Candle, OrderSide, PlannedOrder, ProductConstraints, SubmittedOrder
 
 try:
     import jwt as _jwt
@@ -147,6 +148,28 @@ class CoinbaseDataProvider:
             quote_min_size=data.get("quote_min_size", "1"),
         )
 
+    def _post(self, path: str, body: dict) -> Any:
+        for attempt in range(MAX_RETRIES):
+            headers = self._auth_headers("POST", path)
+            try:
+                resp = self._client.post(path, headers=headers, json=body)
+            except httpx.TransportError:
+                if attempt == MAX_RETRIES - 1:
+                    raise
+                _backoff_wait(attempt)
+                continue
+
+            if resp.status_code == 429 or (500 <= resp.status_code < 600):
+                if attempt == MAX_RETRIES - 1:
+                    resp.raise_for_status()
+                _backoff_wait(attempt)
+                continue
+
+            resp.raise_for_status()
+            return resp.json()
+
+        raise RuntimeError(f"Failed POST {path} after {MAX_RETRIES} retries")
+
     # ------------------------------------------------------------------
     # Accounts / balances
     # ------------------------------------------------------------------
@@ -165,6 +188,63 @@ class CoinbaseDataProvider:
             if asset and (available > 0 or hold > 0):
                 balances[asset] = Balance(asset=asset, available=available, hold=hold)
         return balances
+
+    # ------------------------------------------------------------------
+    # Order submission and polling (Phase 2)
+    # ------------------------------------------------------------------
+
+    def submit_order(self, run_id: str, order: PlannedOrder) -> SubmittedOrder:
+        """Submit a market order; return a SubmittedOrder with status='pending'."""
+        from redline.timeutil import utcnow_iso
+
+        if self.mock:
+            return _mock_submit_order(run_id, order)
+
+        client_order_id = uuid.uuid4().hex
+
+        if order.side == OrderSide.BUY:
+            order_config = {"market_market_ioc": {"quote_size": f"{order.quote_size_usd:.2f}"}}
+        else:
+            order_config = {"market_market_ioc": {"base_size": f"{order.base_size:.8f}"}}
+
+        body = {
+            "client_order_id": client_order_id,
+            "product_id": order.product_id,
+            "side": order.side.value.upper(),
+            "order_configuration": order_config,
+        }
+
+        data = self._post("/api/v3/brokerage/orders", body)
+
+        if not data.get("success"):
+            err = data.get("error_response", {}).get("message", "unknown error")
+            raise RuntimeError(f"Order submission failed for {order.product_id}: {err}")
+
+        order_id = (
+            data.get("success_response", {}).get("order_id")
+            or data.get("order_id", "")
+        )
+
+        return SubmittedOrder(
+            order_id=order_id,
+            client_order_id=client_order_id,
+            run_id=run_id,
+            product_id=order.product_id,
+            side=order.side,
+            base_size=order.base_size,
+            quote_size_usd=order.quote_size_usd,
+            status="pending",
+            submitted_at=utcnow_iso(),
+        )
+
+    def get_order(self, order_id: str) -> dict:
+        """Return the Coinbase order dict for the given order_id."""
+        if self.mock:
+            return _mock_get_order(order_id)
+
+        path = f"/api/v3/brokerage/orders/historical/{order_id}"
+        data = self._get(path)
+        return data.get("order", {})
 
 
 # ------------------------------------------------------------------
@@ -247,3 +327,25 @@ def _mock_balances() -> dict[str, Balance]:
         "BTC": Balance(asset="BTC", available=0.0),
         "ETH": Balance(asset="ETH", available=0.0),
     }
+
+
+def _mock_submit_order(run_id: str, order: PlannedOrder) -> SubmittedOrder:
+    from redline.timeutil import utcnow_iso
+
+    return SubmittedOrder(
+        order_id=f"mock_{uuid.uuid4().hex[:8]}",
+        client_order_id=uuid.uuid4().hex,
+        run_id=run_id,
+        product_id=order.product_id,
+        side=order.side,
+        base_size=order.base_size,
+        quote_size_usd=order.quote_size_usd,
+        status="pending",
+        submitted_at=utcnow_iso(),
+    )
+
+
+def _mock_get_order(order_id: str) -> dict:
+    from redline.timeutil import utcnow_iso
+
+    return {"status": "FILLED", "last_fill_time": utcnow_iso(), "order_id": order_id}
