@@ -26,6 +26,7 @@ class Config:
     max_per_asset_notional: float
     slack_webhook_url: str | None
     mock: bool  # use synthetic data instead of real API calls
+    allow_test_overrides: bool  # must be true + env==dev to accept override flags
 
 
 def load_config(env_file: str | Path | None = ".env") -> Config:
@@ -58,4 +59,5 @@ def load_config(env_file: str | Path | None = ".env") -> Config:
         max_per_asset_notional=float(os.environ.get("REDLINE_MAX_PER_ASSET_NOTIONAL", "0.70")),
         slack_webhook_url=os.environ.get("REDLINE_SLACK_WEBHOOK_URL") or None,
         mock=mock,
+        allow_test_overrides=_bool(os.environ.get("REDLINE_ALLOW_TEST_OVERRIDES", "false")),
     )

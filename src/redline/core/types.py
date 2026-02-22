@@ -123,3 +123,6 @@ class RunRecord:
     planned_orders: list[dict] = field(default_factory=list)
     submitted_orders: list[dict] = field(default_factory=list)
     positions: dict[str, float] = field(default_factory=dict)
+    force_btc_signal: str = "COMPUTED"   # COMPUTED | ON | OFF
+    force_eth_signal: str = "COMPUTED"   # COMPUTED | ON | OFF
+    force_gross_usd: float | None = None

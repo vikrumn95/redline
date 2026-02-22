@@ -96,6 +96,9 @@ class Store:
             for migration in (
                 "ALTER TABLE runs ADD COLUMN skip_reason TEXT",
                 "ALTER TABLE runs ADD COLUMN submitted_orders_json TEXT",
+                "ALTER TABLE runs ADD COLUMN force_btc_signal TEXT",
+                "ALTER TABLE runs ADD COLUMN force_eth_signal TEXT",
+                "ALTER TABLE runs ADD COLUMN force_gross_usd REAL",
             ):
                 try:
                     conn.execute(migration)
@@ -115,8 +118,9 @@ class Store:
                 INSERT OR REPLACE INTO runs
                 (run_id, ts_utc, status, dry_run, equity_usd, peak_equity_usd, drawdown,
                  halt_flag, halt_reason, skip_reason, signals_json, vols_json, targets_json,
-                 planned_orders_json, submitted_orders_json, positions_json)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 planned_orders_json, submitted_orders_json, positions_json,
+                 force_btc_signal, force_eth_signal, force_gross_usd)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     record.run_id,
@@ -135,6 +139,9 @@ class Store:
                     json.dumps(record.planned_orders),
                     json.dumps(record.submitted_orders),
                     json.dumps(record.positions),
+                    record.force_btc_signal,
+                    record.force_eth_signal,
+                    record.force_gross_usd,
                 ),
             )
             conn.commit()
@@ -163,6 +170,9 @@ class Store:
             planned_orders=json.loads(row["planned_orders_json"] or "[]"),
             submitted_orders=json.loads(row["submitted_orders_json"] or "[]"),
             positions=json.loads(row["positions_json"] or "{}"),
+            force_btc_signal=row["force_btc_signal"] or "COMPUTED",
+            force_eth_signal=row["force_eth_signal"] or "COMPUTED",
+            force_gross_usd=float(row["force_gross_usd"]) if row["force_gross_usd"] is not None else None,
         )
 
     # ------------------------------------------------------------------

@@ -71,6 +71,56 @@ def _skip_reason(
     return "min_trade_threshold" if has_delta else "at_target"
 
 
+def _overrides_active(args: argparse.Namespace) -> bool:
+    """Return True if any test override flag deviates from its default."""
+    return (
+        getattr(args, "force_btc_signal", "COMPUTED") != "COMPUTED"
+        or getattr(args, "force_eth_signal", "COMPUTED") != "COMPUTED"
+        or getattr(args, "force_gross_usd", None) is not None
+    )
+
+
+def _apply_signal_overrides(
+    signals: dict[str, bool],
+    force_btc: str,
+    force_eth: str,
+) -> dict[str, bool]:
+    """Apply per-asset signal overrides (ON/OFF) on top of computed signals."""
+    result = dict(signals)
+    if force_btc == "ON":
+        result["BTC-USD"] = True
+    elif force_btc == "OFF":
+        result["BTC-USD"] = False
+    if force_eth == "ON":
+        result["ETH-USD"] = True
+    elif force_eth == "OFF":
+        result["ETH-USD"] = False
+    return result
+
+
+def _compute_forced_targets(
+    force_gross_usd: float,
+    signals: dict[str, bool],
+    equity: float,
+    max_gross_notional: float,
+    max_per_asset_notional: float,
+) -> dict[str, float]:
+    """Allocate a fixed gross USD across risk-on assets, enforcing caps.
+
+    Both risk-on → 50/50 split. One risk-on → 100%. None → all zeros.
+    """
+    risk_on = [p for p in PRODUCTS if signals.get(p)]
+    targets = {p: 0.0 for p in PRODUCTS}
+    gross = min(force_gross_usd, max_gross_notional * equity)
+    if len(risk_on) == 2:
+        per_asset = min(gross / 2.0, max_per_asset_notional * equity)
+        for p in risk_on:
+            targets[p] = per_asset
+    elif len(risk_on) == 1:
+        targets[risk_on[0]] = min(gross, max_per_asset_notional * equity)
+    return targets
+
+
 def cmd_run(args: argparse.Namespace, cfg: Config) -> None:
     run_id = uuid.uuid4().hex[:8]
     logger = RunLogger(run_id, cfg.log_level)
@@ -125,6 +175,37 @@ def cmd_run(args: argparse.Namespace, cfg: Config) -> None:
             )
         )
         sys.exit(0)
+
+    # ------------------------------------------------------------------ #
+    # 1b. Override gating: reject test flags in non-dev / disallowed envs  #
+    # ------------------------------------------------------------------ #
+    force_btc = getattr(args, "force_btc_signal", "COMPUTED")
+    force_eth = getattr(args, "force_eth_signal", "COMPUTED")
+    force_gross = getattr(args, "force_gross_usd", None)
+
+    if _overrides_active(args):
+        if not (cfg.allow_test_overrides and cfg.env == "dev"):
+            print(
+                "Error: test override flags require REDLINE_ALLOW_TEST_OVERRIDES=true "
+                "and REDLINE_ENV=dev",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        logger.warning(
+            "TEST_OVERRIDE_ACTIVE",
+            force_btc_signal=force_btc,
+            force_eth_signal=force_eth,
+            force_gross_usd=force_gross,
+        )
+        alerts.send_alert(
+            "TEST_OVERRIDE_ACTIVE",
+            {
+                "force_btc_signal": force_btc,
+                "force_eth_signal": force_eth,
+                "force_gross_usd": force_gross,
+            },
+            dry_run,
+        )
 
     # ------------------------------------------------------------------ #
     # 2a. Fetch candles (needed for current prices)                        #
@@ -236,6 +317,15 @@ def cmd_run(args: argparse.Namespace, cfg: Config) -> None:
             last_close=round(closes[-1], 2),
         )
 
+    # Apply per-asset signal overrides (ON/OFF) if active
+    if _overrides_active(args):
+        signals = _apply_signal_overrides(signals, force_btc, force_eth)
+        logger.info(
+            "signals_after_overrides",
+            BTC_USD=signals.get("BTC-USD"),
+            ETH_USD=signals.get("ETH-USD"),
+        )
+
     # ------------------------------------------------------------------ #
     # 5. Compute target notionals (inverse-vol weights + vol scaling)      #
     # ------------------------------------------------------------------ #
@@ -253,6 +343,12 @@ def cmd_run(args: argparse.Namespace, cfg: Config) -> None:
             cfg.max_per_asset_notional,
         )
         target_notionals.update(scaled)
+
+    # Apply forced gross USD override (replaces vol-target sizing)
+    if force_gross is not None:
+        target_notionals = _compute_forced_targets(
+            force_gross, signals, equity, cfg.max_gross_notional, cfg.max_per_asset_notional
+        )
 
     logger.info(
         "targets_computed",
@@ -352,25 +448,33 @@ def cmd_run(args: argparse.Namespace, cfg: Config) -> None:
             planned_orders=[o.to_dict() for o in planned],
             submitted_orders=submitted_orders_dicts,
             positions={k: v.available for k, v in balances.items()},
+            force_btc_signal=force_btc,
+            force_eth_signal=force_eth,
+            force_gross_usd=force_gross,
         )
     )
 
     # ------------------------------------------------------------------ #
     # 9. Alert                                                             #
     # ------------------------------------------------------------------ #
+    rebalance_data: dict = {
+        "equity_usd": f"{equity:.2f}",
+        "peak_equity_usd": f"{new_peak:.2f}",
+        "drawdown": f"{drawdown:.2%}",
+        "BTC_risk_on": signals.get("BTC-USD"),
+        "ETH_risk_on": signals.get("ETH-USD"),
+        "BTC_target_notional": f"{target_notionals.get('BTC-USD', 0):.2f}",
+        "ETH_target_notional": f"{target_notionals.get('ETH-USD', 0):.2f}",
+        "orders": len(executed) if executed else "none",
+        "skip_reason": reason,
+    }
+    if _overrides_active(args):
+        rebalance_data["TEST_OVERRIDE"] = (
+            f"btc={force_btc} eth={force_eth} gross_usd={force_gross}"
+        )
     alerts.send_alert(
         "REBALANCE_COMPLETED",
-        {
-            "equity_usd": f"{equity:.2f}",
-            "peak_equity_usd": f"{new_peak:.2f}",
-            "drawdown": f"{drawdown:.2%}",
-            "BTC_risk_on": signals.get("BTC-USD"),
-            "ETH_risk_on": signals.get("ETH-USD"),
-            "BTC_target_notional": f"{target_notionals.get('BTC-USD', 0):.2f}",
-            "ETH_target_notional": f"{target_notionals.get('ETH-USD', 0):.2f}",
-            "orders": len(executed) if executed else "none",
-            "skip_reason": reason,
-        },
+        rebalance_data,
         dry_run,
     )
 
@@ -436,6 +540,16 @@ def cmd_status(cfg: Config) -> None:
         for product, notional in (last.targets or {}).items():
             print(f"  {product}: ${notional:,.2f}")
 
+        if (
+            last.force_btc_signal != "COMPUTED"
+            or last.force_eth_signal != "COMPUTED"
+            or last.force_gross_usd is not None
+        ):
+            print("\n--- Last Run Overrides ---")
+            print(f"  force_btc_signal: {last.force_btc_signal}")
+            print(f"  force_eth_signal: {last.force_eth_signal}")
+            print(f"  force_gross_usd : {last.force_gross_usd}")
+
 
 def cmd_reset_halt(args: argparse.Namespace, cfg: Config) -> None:
     store = Store(cfg.db_path)
@@ -492,6 +606,25 @@ def main() -> None:
     run_p = sub.add_parser("run", help="Run a rebalance cycle")
     run_p.add_argument("--dry-run", action="store_true", default=False)
     run_p.add_argument("--mock", action="store_true", default=False, help="Use synthetic data (no Coinbase credentials needed)")
+    _signal_choices = ["COMPUTED", "ON", "OFF"]
+    run_p.add_argument(
+        "--force-btc-signal",
+        choices=_signal_choices,
+        default="COMPUTED",
+        help="Override BTC-USD SMA200 signal for this run (requires REDLINE_ALLOW_TEST_OVERRIDES=true + REDLINE_ENV=dev)",
+    )
+    run_p.add_argument(
+        "--force-eth-signal",
+        choices=_signal_choices,
+        default="COMPUTED",
+        help="Override ETH-USD SMA200 signal for this run (requires REDLINE_ALLOW_TEST_OVERRIDES=true + REDLINE_ENV=dev)",
+    )
+    run_p.add_argument(
+        "--force-gross-usd",
+        type=float,
+        default=None,
+        help="Override desired gross notional USD for this run; 50/50 split when both assets risk-on (requires REDLINE_ALLOW_TEST_OVERRIDES=true + REDLINE_ENV=dev)",
+    )
 
     status_p = sub.add_parser("status", help="Print status from SQLite + live balances")
     status_p.add_argument("--mock", action="store_true", default=False, help="Use synthetic data for live balances")

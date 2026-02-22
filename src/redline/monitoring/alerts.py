@@ -10,7 +10,11 @@ from redline.logging import RunLogger
 
 # Events that must trigger a Slack alert when webhook is configured.
 ALERT_EVENTS = frozenset(
-    {"HALT_TRIGGERED", "HALT_GATING_ACTIVE", "REBALANCE_COMPLETED", "REBALANCE_SKIPPED", "RISK_CIRCUIT_BREAKER"}
+    {
+        "HALT_TRIGGERED", "HALT_GATING_ACTIVE",
+        "REBALANCE_COMPLETED", "REBALANCE_SKIPPED", "RISK_CIRCUIT_BREAKER",
+        "TEST_OVERRIDE_ACTIVE",
+    }
 )
 
 

@@ -39,6 +39,7 @@ def _cfg(tmp_path: Path) -> Config:
         max_per_asset_notional=0.70,
         slack_webhook_url=None,
         mock=True,
+        allow_test_overrides=False,
     )
 
 
