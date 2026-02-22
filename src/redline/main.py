@@ -29,6 +29,46 @@ from redline.timeutil import utcnow_iso
 PRODUCTS = ["BTC-USD", "ETH-USD"]
 
 
+def _skip_reason(
+    signals: dict[str, bool],
+    target_notionals: dict[str, float],
+    balances: dict,
+    prices: dict[str, float],
+    executed: list,
+    min_trade_usd: float,
+) -> str | None:
+    """Return a skip reason if no orders were placed, else None.
+
+    Possible values:
+      risk_off_both       — all assets are risk-off (target = 0 for all)
+      min_trade_threshold — deltas exist but all are below the $50 minimum
+      at_target           — already positioned at target; nothing to trade
+    """
+    if executed:
+        return None
+
+    risk_on = [p for p, s in signals.items() if s]
+    if not risk_on:
+        return "risk_off_both"
+
+    # Check whether any non-trivial delta exists before the min-trade filter
+    from redline.core.types import Balance
+
+    has_delta = False
+    for product_id, target_notional in target_notionals.items():
+        base = product_id.split("-")[0]
+        price = prices.get(base, 0.0)
+        if price <= 0:
+            continue
+        current_qty = balances.get(base, Balance(base, 0.0)).available
+        current_notional = current_qty * price
+        if abs(target_notional - current_notional) >= min_trade_usd:
+            has_delta = True
+            break
+
+    return "min_trade_threshold" if has_delta else "at_target"
+
+
 def cmd_run(args: argparse.Namespace, cfg: Config) -> None:
     run_id = uuid.uuid4().hex[:8]
     logger = RunLogger(run_id, cfg.log_level)
@@ -111,6 +151,7 @@ def cmd_run(args: argparse.Namespace, cfg: Config) -> None:
                 drawdown=drawdown,
                 halt_flag=True,
                 halt_reason=cb_reason,
+                skip_reason="halted",
                 positions={k: v.available for k, v in balances.items()},
                 planned_orders=[o.to_dict() for o in executed],
             )
@@ -119,6 +160,7 @@ def cmd_run(args: argparse.Namespace, cfg: Config) -> None:
             "RISK_CIRCUIT_BREAKER",
             {
                 "reason": cb_reason,
+                "skip_reason": "halted",
                 "equity_usd": f"{equity:.2f}",
                 "peak_equity_usd": f"{peak_equity:.2f}",
                 "drawdown": f"{drawdown:.2%}",
@@ -189,6 +231,7 @@ def cmd_run(args: argparse.Namespace, cfg: Config) -> None:
     # ------------------------------------------------------------------ #
     # 8. Persist                                                           #
     # ------------------------------------------------------------------ #
+    reason = _skip_reason(signals, target_notionals, balances, prices, executed, cfg.min_trade_usd)
     new_peak = max(peak_equity, equity)
     drawdown = (new_peak - equity) / new_peak if new_peak > 0 else 0.0
     store.save_equity_snapshot(EquitySnapshot(run_id=run_id, ts_utc=utcnow_iso(), equity_usd=equity))
@@ -202,6 +245,7 @@ def cmd_run(args: argparse.Namespace, cfg: Config) -> None:
             peak_equity_usd=new_peak,
             drawdown=drawdown,
             halt_flag=False,
+            skip_reason=reason,
             signals=signals,
             vols=vols,
             targets=target_notionals,
@@ -224,6 +268,7 @@ def cmd_run(args: argparse.Namespace, cfg: Config) -> None:
             "BTC_target_notional": f"{target_notionals.get('BTC-USD', 0):.2f}",
             "ETH_target_notional": f"{target_notionals.get('ETH-USD', 0):.2f}",
             "orders": len(executed) if executed else "none",
+            "skip_reason": reason,
         },
         dry_run,
     )
@@ -234,6 +279,7 @@ def cmd_run(args: argparse.Namespace, cfg: Config) -> None:
         status="ok",
         equity_usd=round(equity, 2),
         orders_planned=len(executed),
+        skip_reason=reason,
     )
 
 
@@ -256,6 +302,7 @@ def cmd_status(cfg: Config) -> None:
 
     if last:
         print(f"Last run   : {last.ts_utc}  [{last.status.value}]")
+        print(f"Skip reason: {last.skip_reason or 'none (orders placed)'}")
         print(f"Equity     : ${last.equity_usd:,.2f}")
         print(f"Peak equity: ${last.peak_equity_usd:,.2f}")
         print(f"Drawdown   : {last.drawdown:.2%}")
@@ -287,11 +334,15 @@ def main() -> None:
 
     run_p = sub.add_parser("run", help="Run a rebalance cycle")
     run_p.add_argument("--dry-run", action="store_true", default=False)
+    run_p.add_argument("--mock", action="store_true", default=False, help="Use synthetic data (no Coinbase credentials needed)")
 
-    sub.add_parser("status", help="Print status from SQLite + live balances")
+    status_p = sub.add_parser("status", help="Print status from SQLite + live balances")
+    status_p.add_argument("--mock", action="store_true", default=False, help="Use synthetic data for live balances")
 
     args = parser.parse_args()
     cfg = load_config()
+    if args.mock:
+        cfg.mock = True
 
     if args.command == "run":
         cmd_run(args, cfg)

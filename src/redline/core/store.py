@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS runs (
     drawdown          REAL,
     halt_flag         INTEGER DEFAULT 0,
     halt_reason       TEXT,
+    skip_reason       TEXT,
     signals_json      TEXT,
     vols_json         TEXT,
     targets_json      TEXT,
@@ -62,6 +63,11 @@ class Store:
             conn.execute(_CREATE_EQUITY_HISTORY)
             conn.execute(_CREATE_HALT_STATE)
             conn.execute("INSERT OR IGNORE INTO halt_state (id, halt_flag) VALUES (1, 0)")
+            # Migration: add skip_reason column to existing DBs
+            try:
+                conn.execute("ALTER TABLE runs ADD COLUMN skip_reason TEXT")
+            except sqlite3.OperationalError:
+                pass  # column already exists
             conn.commit()
 
     # ------------------------------------------------------------------
@@ -75,9 +81,9 @@ class Store:
                 """
                 INSERT OR REPLACE INTO runs
                 (run_id, ts_utc, status, dry_run, equity_usd, peak_equity_usd, drawdown,
-                 halt_flag, halt_reason, signals_json, vols_json, targets_json,
+                 halt_flag, halt_reason, skip_reason, signals_json, vols_json, targets_json,
                  planned_orders_json, positions_json)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     record.run_id,
@@ -89,6 +95,7 @@ class Store:
                     record.drawdown,
                     int(record.halt_flag),
                     record.halt_reason,
+                    record.skip_reason,
                     json.dumps(record.signals),
                     json.dumps(record.vols),
                     json.dumps(record.targets),
@@ -115,6 +122,7 @@ class Store:
             drawdown=float(row["drawdown"] or 0.0),
             halt_flag=bool(row["halt_flag"]),
             halt_reason=row["halt_reason"],
+            skip_reason=row["skip_reason"],
             signals=json.loads(row["signals_json"] or "{}"),
             vols=json.loads(row["vols_json"] or "{}"),
             targets=json.loads(row["targets_json"] or "{}"),

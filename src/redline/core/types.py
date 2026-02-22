@@ -85,6 +85,7 @@ class RunRecord:
     drawdown: float
     halt_flag: bool = False
     halt_reason: str | None = None
+    skip_reason: str | None = None  # null if >=1 order placed; e.g. "risk_off_both", "min_trade_threshold", "at_target", "halted"
     signals: dict[str, bool] = field(default_factory=dict)
     vols: dict[str, float] = field(default_factory=dict)
     targets: dict[str, float] = field(default_factory=dict)
