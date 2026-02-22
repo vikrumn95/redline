@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import uuid
 
@@ -81,11 +82,49 @@ def cmd_run(args: argparse.Namespace, cfg: Config) -> None:
     # 1. Open SQLite                                                       #
     # ------------------------------------------------------------------ #
     store = Store(cfg.db_path)
-    halt_flag, halt_reason = store.get_halt_state()
-    if halt_flag:
-        logger.warning("prior_halt_detected", reason=halt_reason)
-
     alerts = AlertManager(cfg.slack_webhook_url, run_id, logger, cfg.env)
+
+    halt_flag, halt_reason, halted_at = store.get_halt_state_full()
+    if halt_flag:
+        last_run = store.load_last_run()
+        logger.warning(
+            "HALT_GATING_ACTIVE",
+            halt_reason=halt_reason,
+            halted_at=halted_at,
+            last_run_id=last_run.run_id if last_run else None,
+        )
+        alerts.send_alert(
+            "HALT_GATING_ACTIVE",
+            {
+                "halt_reason": halt_reason,
+                "halted_at": halted_at,
+                "last_run_id": last_run.run_id if last_run else None,
+            },
+            dry_run,
+        )
+        equity_snaps = store.load_equity_history(days=1)
+        last_equity = equity_snaps[0].equity_usd if equity_snaps else 0.0
+        peak_equity_for_skip = store.load_peak_equity() or last_equity
+        drawdown_for_skip = (
+            (peak_equity_for_skip - last_equity) / peak_equity_for_skip
+            if peak_equity_for_skip > 0
+            else 0.0
+        )
+        store.save_run(
+            RunRecord(
+                run_id=run_id,
+                ts_utc=utcnow_iso(),
+                status=RunStatus.SKIPPED,
+                dry_run=dry_run,
+                equity_usd=last_equity,
+                peak_equity_usd=peak_equity_for_skip,
+                drawdown=drawdown_for_skip,
+                halt_flag=True,
+                halt_reason=halt_reason,
+                skip_reason="HALTED",
+            )
+        )
+        sys.exit(0)
 
     # ------------------------------------------------------------------ #
     # 2a. Fetch candles (needed for current prices)                        #
@@ -138,8 +177,12 @@ def cmd_run(args: argparse.Namespace, cfg: Config) -> None:
         policy = DryRunPolicy(logger)
         executed = policy.execute(liq_orders)
 
-        store.set_halt(cb_reason or "circuit_breaker")
         drawdown = (peak_equity - equity) / peak_equity if peak_equity > 0 else 0.0
+        store.set_halt(
+            cb_reason or "circuit_breaker",
+            run_id=run_id,
+            details_json=json.dumps({"equity_usd": equity, "peak_equity_usd": peak_equity, "drawdown": f"{drawdown:.4f}"}),
+        )
         store.save_equity_snapshot(EquitySnapshot(run_id=run_id, ts_utc=utcnow_iso(), equity_usd=equity))
         store.save_run(
             RunRecord(
@@ -244,8 +287,12 @@ def cmd_run(args: argparse.Namespace, cfg: Config) -> None:
             submitted_orders_dicts = [o.to_dict() for o in executed]
         except ExecutionHaltError as exc:
             logger.error("execution_halt", reason=exc.reason)
-            store.set_halt(exc.reason)
             drawdown_halt = (peak_equity - equity) / peak_equity if peak_equity > 0 else 0.0
+            store.set_halt(
+                exc.reason,
+                run_id=run_id,
+                details_json=json.dumps({"error": exc.reason, "equity_usd": equity, "drawdown": f"{drawdown_halt:.4f}"}),
+            )
             store.save_equity_snapshot(
                 EquitySnapshot(run_id=run_id, ts_utc=utcnow_iso(), equity_usd=equity)
             )
@@ -339,7 +386,7 @@ def cmd_run(args: argparse.Namespace, cfg: Config) -> None:
 
 def cmd_status(cfg: Config) -> None:
     store = Store(cfg.db_path)
-    halt_flag, halt_reason = store.get_halt_state()
+    halt_flag, halt_reason, halted_at = store.get_halt_state_full()
     last = store.load_last_run()
 
     broker = CoinbaseSpotBroker(cfg.coinbase_api_key, cfg.coinbase_api_secret, cfg.mock)
@@ -353,6 +400,16 @@ def cmd_status(cfg: Config) -> None:
     print(f"Halt flag  : {halt_flag}")
     if halt_reason:
         print(f"Halt reason: {halt_reason}")
+    if halted_at:
+        print(f"Halted at  : {halted_at}")
+
+    halt_events = store.load_halt_events(limit=20)
+    last_triggered = next((e for e in halt_events if e["event_type"] == "HALT_TRIGGERED"), None)
+    last_reset = next((e for e in halt_events if e["event_type"] == "HALT_RESET"), None)
+    if last_triggered:
+        print(f"Last HALT_TRIGGERED: {last_triggered['ts_utc']} — {last_triggered['reason']}")
+    if last_reset:
+        print(f"Last HALT_RESET    : {last_reset['ts_utc']} — {last_reset['reason']}")
 
     if last:
         print(f"Last run   : {last.ts_utc}  [{last.status.value}]")
@@ -380,6 +437,52 @@ def cmd_status(cfg: Config) -> None:
             print(f"  {product}: ${notional:,.2f}")
 
 
+def cmd_reset_halt(args: argparse.Namespace, cfg: Config) -> None:
+    store = Store(cfg.db_path)
+    halt_flag, halt_reason, halted_at = store.get_halt_state_full()
+
+    if not halt_flag:
+        print("Not halted")
+        sys.exit(0)
+
+    reason = (args.reason or "").strip()
+    if not reason:
+        print("Error: --reason is required and must not be empty", file=sys.stderr)
+        sys.exit(1)
+
+    if args.require_reconcile:
+        data_provider = CoinbaseDataProvider(cfg.coinbase_api_key, cfg.coinbase_api_secret, cfg.mock)
+        broker = CoinbaseSpotBroker(cfg.coinbase_api_key, cfg.coinbase_api_secret, cfg.mock)
+        try:
+            candles: dict = {}
+            for product in PRODUCTS:
+                candles[product] = data_provider.fetch_candles(product, min_count=250)
+            prices: dict[str, float] = {}
+            for product in PRODUCTS:
+                base = product.split("-")[0]
+                if candles.get(product):
+                    prices[base] = sorted(candles[product], key=lambda c: c.ts_utc)[-1].close
+            balances = broker.fetch_balances()
+            compute_equity(balances, prices)
+        except Exception as exc:
+            print(f"Reconcile failed: {exc}", file=sys.stderr)
+            sys.exit(2)
+
+    last_run = store.load_last_run()
+    details = json.dumps({
+        "previous_halt_reason": halt_reason,
+        "previous_halted_at": halted_at,
+    })
+    store.log_halt_event(
+        "HALT_RESET",
+        reason,
+        run_id=last_run.run_id if last_run else None,
+        details_json=details,
+    )
+    store.clear_halt()
+    print(f"Halt cleared. Reason: {reason}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="python -m redline.main", description="Redline BTC/ETH trading bot"
@@ -393,6 +496,16 @@ def main() -> None:
     status_p = sub.add_parser("status", help="Print status from SQLite + live balances")
     status_p.add_argument("--mock", action="store_true", default=False, help="Use synthetic data for live balances")
 
+    reset_p = sub.add_parser("reset-halt", help="Clear a halt and write an audit record")
+    reset_p.add_argument("--reason", required=True, help="Human-readable reason for clearing the halt")
+    reset_p.add_argument(
+        "--require-reconcile",
+        action="store_true",
+        default=False,
+        help="Perform a read-only reconciliation check before clearing (exits 2 if it fails)",
+    )
+    reset_p.add_argument("--mock", action="store_true", default=False, help="Use synthetic data")
+
     args = parser.parse_args()
     cfg = load_config()
     if args.mock:
@@ -402,6 +515,8 @@ def main() -> None:
         cmd_run(args, cfg)
     elif args.command == "status":
         cmd_status(cfg)
+    elif args.command == "reset-halt":
+        cmd_reset_halt(args, cfg)
 
 
 if __name__ == "__main__":

@@ -46,6 +46,17 @@ CREATE TABLE IF NOT EXISTS halt_state (
 )
 """
 
+_CREATE_HALT_EVENTS = """
+CREATE TABLE IF NOT EXISTS halt_events (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts_utc       TEXT NOT NULL,
+    event_type   TEXT NOT NULL,
+    run_id       TEXT,
+    reason       TEXT NOT NULL,
+    details_json TEXT
+)
+"""
+
 _CREATE_ORDERS = """
 CREATE TABLE IF NOT EXISTS orders (
     order_id        TEXT PRIMARY KEY,
@@ -78,6 +89,7 @@ class Store:
             conn.execute(_CREATE_RUNS)
             conn.execute(_CREATE_EQUITY_HISTORY)
             conn.execute(_CREATE_HALT_STATE)
+            conn.execute(_CREATE_HALT_EVENTS)
             conn.execute(_CREATE_ORDERS)
             conn.execute("INSERT OR IGNORE INTO halt_state (id, halt_flag) VALUES (1, 0)")
             # Migrations: add new columns to existing DBs
@@ -188,7 +200,12 @@ class Store:
     # Halt state
     # ------------------------------------------------------------------
 
-    def set_halt(self, reason: str) -> None:
+    def set_halt(
+        self,
+        reason: str,
+        run_id: str | None = None,
+        details_json: str | None = None,
+    ) -> None:
         from redline.timeutil import utcnow_iso
 
         with self._conn() as conn:
@@ -197,6 +214,7 @@ class Store:
                 (reason, utcnow_iso()),
             )
             conn.commit()
+        self.log_halt_event("HALT_TRIGGERED", reason, run_id=run_id, details_json=details_json)
 
     def clear_halt(self) -> None:
         from redline.timeutil import utcnow_iso
@@ -216,6 +234,41 @@ class Store:
         if row is None:
             return False, None
         return bool(row["halt_flag"]), row["halt_reason"]
+
+    def get_halt_state_full(self) -> tuple[bool, str | None, str | None]:
+        """Return (halt_flag, halt_reason, halted_at) where halted_at is the updated_utc timestamp."""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT halt_flag, halt_reason, updated_utc FROM halt_state WHERE id=1"
+            ).fetchone()
+        if row is None:
+            return False, None, None
+        return bool(row["halt_flag"]), row["halt_reason"], row["updated_utc"]
+
+    def log_halt_event(
+        self,
+        event_type: str,
+        reason: str,
+        run_id: str | None = None,
+        details_json: str | None = None,
+    ) -> None:
+        from redline.timeutil import utcnow_iso
+
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT INTO halt_events (ts_utc, event_type, run_id, reason, details_json) VALUES (?,?,?,?,?)",
+                (utcnow_iso(), event_type, run_id, reason, details_json),
+            )
+            conn.commit()
+
+    def load_halt_events(self, limit: int = 10) -> list[dict]:
+        """Return halt_events rows, newest first."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT ts_utc, event_type, run_id, reason, details_json FROM halt_events ORDER BY ts_utc DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     # ------------------------------------------------------------------
     # Orders (Phase 2)
