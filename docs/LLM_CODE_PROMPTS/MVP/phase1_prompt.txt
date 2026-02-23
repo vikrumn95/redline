@@ -1,0 +1,63 @@
+PHASE 1 (Vertical Slice / Dry-Run Pipeline)
+
+Read SPEC.md in this repo. SPEC.md is the absolute source of truth. Implement Phase 1 ONLY (dry-run vertical slice) into the existing redline repo skeleton. Do not change the folder structure.
+
+PHASE 1 GOAL (Vertical Slice: Dry-Run Pipeline)
+Implement the end-to-end pipeline that runs successfully in dry-run mode:
+1) Config loading (env vars + optional .env)
+2) Open/init SQLite at REDLINE_DB_PATH (default ./data/redline.db; create parent dir)
+3) Fetch required market data:
+   - Fetch >=250 daily candles for BTC-USD and ETH-USD aligned to 00:00 UTC cutoff
+   - Implement pagination backwards until >=250 candles
+   - Implement exponential backoff w/ jitter on HTTP 429 and transient 5xx
+4) Compute indicators:
+   - SMA200 signal (Close > SMA200 => risk-on)
+   - N=20 daily log returns, sample stdev, annualize with sqrt(365) EXACTLY as SPEC
+5) Reconcile balances (READ-ONLY) and compute equity deterministically:
+   - equity_usd = available_usd + available_btc*btc_price + available_eth*eth_price
+   - do not rely on Coinbase aggregate portfolio totals
+6) Evaluate circuit breakers ONLY at start of run (as per SPEC):
+   - daily loss and drawdown computed from SQLite equity history
+   - In Phase 1 (dry-run only), if breaker triggers, DO NOT place real orders; instead:
+     - log planned liquidation orders (“go flat”) to USD
+     - set halt flag + reason in SQLite
+     - send Slack alert if configured
+     - exit
+7) Target sizing and order planning (dry-run):
+   - inverse-vol weights over risk-on assets only
+   - portfolio vol scaling simplification: correlation=1.0, sigma_port = sum(w_i * sigma_ann_i)
+   - scale exposure to target vol 0.25 subject to caps:
+     - max gross notional 1.0*equity, max per-asset 0.70*equity, min trade $50
+   - plan orders from current -> target notionals/qtys and round quantities using product constraints
+   - DO NOT submit orders; only emit planned orders to structured logs
+8) Persistence:
+   - persist run_id, run status, signals, vols, targets, planned orders, positions snapshot, equity snapshot, peak equity, drawdown, halt flag/reason into SQLite
+9) Observability:
+   - JSON logs to stdout (JSON lines), include run_id in every log line
+   - Slack webhook alerts implemented per SPEC (optional; if unset log ALERT_DISABLED once per run_id)
+   - Implement `python -m redline.main status` to print positions, last run, drawdown, halt state
+
+IMPORTANT CONSTRAINTS
+- Do NOT implement any live order execution functions yet. No create-order / submit-order calls.
+- It is OK to implement Coinbase read-only calls needed for candles, product constraints, balances.
+- Keep code minimal; no websockets, no extra strategies, no dashboards.
+
+CLI REQUIREMENTS (must work)
+- `python -m redline.main run --dry-run` runs end-to-end and writes to SQLite.
+- `python -m redline.main status` prints a summary from SQLite + current balances (read-only is fine).
+
+TESTING (minimum)
+Add unit tests for:
+- SMA200 computation
+- volatility math (log returns, sample stdev with /19, annualize sqrt(365))
+- portfolio-vol scaling simplification (sigma_port = sum(w_i*sigma_i), no covariance matrix)
+- sizing caps and min trade threshold
+- equity calculation formula
+
+Use mocks/stubs for Coinbase API in tests. Keep production adapter real but test-safe.
+
+DELIVERABLE
+When done, ensure:
+- `pytest` passes
+- `python -m redline.main run --dry-run` works without needing real Coinbase credentials (use a mock mode if needed)
+Then stop. Do not proceed to Phase 2 (live execution) until I ask.

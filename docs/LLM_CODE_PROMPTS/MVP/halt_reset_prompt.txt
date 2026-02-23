@@ -1,0 +1,95 @@
+HALT HARD-GATING + MANUAL RESET + halt_events AUDIT TABLE
+
+I need you to update the existing redline repo to make HALT behavior “hard gating” (requires manual reset), and add a manual reset CLI command with an audit trail. Phase 1/2 code already exists; do NOT refactor or restructure unrelated systems. Keep changes minimal and consistent with the current CLI style and SQLite persistence.
+
+CRITICAL CONTEXT
+- Right now the bot persists a halt flag/reason, but on startup it only logs a warning and continues. This must change.
+- After this change, if the bot is halted, it must NOT run strategy planning or submit any orders (even in dry-run), until manually reset.
+
+GOALS
+1) Hard-gating HALT: if halted in SQLite, the next run must exit early and do nothing except reconcile/read state + alert.
+2) Manual reset: add `reset-halt` CLI command that clears the halt and writes an audit record.
+3) Audit trail: create a new SQLite table `halt_events` to record both HALT_TRIGGERED and HALT_RESET events.
+
+REQUIREMENTS
+
+A) Hard-gating HALT behavior (required)
+- On startup of `python -m redline.main run ...` (both dry-run and live), check halt state from SQLite BEFORE doing any of the following:
+  - fetching candles
+  - computing signals/vol/targets
+  - planning orders
+  - submitting orders
+- If halt_flag is set:
+  1) Log a structured event `HALT_GATING_ACTIVE` to stdout (include halt_reason, halted_at if available, last_run_id if available).
+  2) Send a Slack alert (if REDLINE_SLACK_WEBHOOK_URL is set) with event type `HALT_GATING_ACTIVE`.
+  3) Persist a run record as SKIPPED with:
+     - skip_reason = "HALTED"
+     - skip_detail = the halt_reason
+  4) Exit cleanly with code 0.
+- There must be no way for the bot to resume trading automatically after a halt; only manual reset can clear it.
+
+B) New SQLite table: halt_events (required)
+- Create a new table `halt_events` (via your existing DB init/migration mechanism).
+- Schema (minimum columns):
+  - id INTEGER PRIMARY KEY AUTOINCREMENT
+  - ts_utc TEXT NOT NULL (ISO-8601 UTC timestamp)
+  - event_type TEXT NOT NULL  -- values: "HALT_TRIGGERED" | "HALT_RESET"
+  - run_id TEXT               -- nullable; set when known
+  - reason TEXT NOT NULL      -- human readable reason (for reset, user-supplied)
+  - details_json TEXT         -- nullable JSON string for extra context (old halt_reason, etc.)
+- Ensure all existing halt trigger points also write a HALT_TRIGGERED row to halt_events:
+  - reason should be the halt_reason already being set
+  - details_json should include any useful context (e.g., mismatch amounts, order_id, exception text)
+- If you already have any audit table, do NOT create a duplicate. Prefer adding halt_events if no equivalent exists.
+
+C) CLI command: reset-halt (required)
+- Add a new CLI command:
+  - `python -m redline.main reset-halt --reason "..." [--require-reconcile]`
+- Behavior:
+  1) Open SQLite and load current bot state.
+  2) If bot is NOT halted:
+     - print "Not halted" and exit 0
+     - do NOT insert into halt_events
+  3) If bot IS halted:
+     - If --require-reconcile is present:
+       - perform the existing read-only reconciliation check used at the start of a run
+       - if reconcile fails:
+         - print a clear failure message
+         - do NOT clear halt
+         - do NOT write HALT_RESET (prefer this semantics)
+         - exit with code 2
+     - Insert a row into halt_events with:
+       - event_type="HALT_RESET"
+       - reason=user provided string (required; fail fast if missing/empty)
+       - run_id=last_run_id if available else NULL
+       - details_json containing at least: previous halt_reason, previous halted_at, and any other stored context
+     - Clear the halt state in SQLite:
+       - halted=false
+       - halt_reason=NULL
+       - halted_at=NULL (if present)
+     - Print confirmation: "Halt cleared" plus the provided reason.
+
+D) Status output (required)
+- Update `python -m redline.main status` to show:
+  - current halted state + halt_reason
+  - timestamp of most recent HALT_TRIGGERED and HALT_RESET events (if any)
+  - last run status + skip_reason (if last run was skipped)
+
+E) Tests (required)
+- Add unit tests (use temp SQLite DB) covering:
+  1) Hard-gating: if halt_flag is set, `run` exits early and does NOT call candle fetch / signal calc / order planning / order submission (assert via mocks).
+  2) reset-halt when not halted: no DB changes, no halt_events insert.
+  3) reset-halt when halted: clears halt fields and inserts HALT_RESET.
+  4) reset-halt --require-reconcile with failing reconcile: halt remains set, no HALT_RESET insert, exit code 2.
+  5) HALT_TRIGGERED writes a halt_events row when a halt is set.
+
+CONSTRAINTS
+- Do NOT modify trading strategy logic, signal math, sizing, or execution modules beyond what is needed to:
+  - hard-gate on existing halt state at startup, and
+  - write audit events when halts are triggered.
+- Keep DB migrations minimal and backward compatible (handle existing DB without data loss).
+
+DELIVERABLE
+- `pytest` passes
+- Provide a brief summary of what you changed and where (files + key functions)
+Stop after implementing this feature.

@@ -1,0 +1,67 @@
+PHASE 2 (Live Coinbase Execution + client_order_id + idempotency)
+
+I need you to implement Phase 2 of the trading bot (Live Coinbase Execution).
+
+CRITICAL CONTEXT:
+- Phase 1 is complete: CLI, SQLite persistence, risk controls, candle fetching, signal/vol math, target sizing, order planning, logging, and Slack alerts all work.
+- Do NOT rewrite or restructure those systems. Do NOT change any strategy math, sizing rules, caps, candle logic, or database schema unless it is strictly required for Phase 2.
+- Your only goal is to wire up live Coinbase order submission + verification when REDLINE_DRY_RUN=false, while keeping dry-run behavior unchanged.
+
+PHASE 2 REQUIREMENTS
+
+1) Safety gate (strict)
+- If REDLINE_DRY_RUN=true: execution must return immediately and must NOT call any trading/order-creation endpoints (no POST create-order).
+- Dry-run output/logging/DB writes must remain unchanged.
+
+2) Execute only planned orders
+- Only execute orders produced by the existing order-planning step (after min trade threshold, rounding, and caps).
+- Enforce: at most ONE order per asset per run (BTC-USD max 1, ETH-USD max 1).
+
+3) Coinbase payload requirements (strict)
+- Market BUY orders must use quote_size (USD).
+- Market SELL orders must use base_size (crypto quantity).
+- Every order payload must include a unique client_order_id.
+  - Generate a UUID for each order.
+  - Persist client_order_id into SQLite as part of the order record.
+  - Pass client_order_id in the POST request payload.
+- The adapter must construct payloads accordingly.
+
+4) Idempotency / double-spend prevention (two layers)
+- Local (SQLite) idempotency check BEFORE submit:
+  - If an order already exists for (run_id, product_id, side), do not submit again.
+- Coinbase-side idempotency:
+  - Use client_order_id so the server de-dupes repeats.
+- Crash safety:
+  - After a successful submit response, persist the order record immediately (run_id, product_id, side, client_order_id, coinbase_order_id, and initial status) BEFORE any further steps.
+
+5) Post-trade verification loop
+- After submission, verify completion via polling:
+  - Poll no faster than once per 2 seconds per order.
+  - Exponential backoff with jitter on HTTP 429 and transient 5xx.
+  - Timeout after 60 seconds total.
+- If any order is unresolved/unknown after timeout:
+  - Trigger the existing HALT logic (persist halt flag + reason, Slack alert, exit).
+
+6) Persistence + observability
+- Ensure SQLite records include, per run:
+  - planned orders
+  - submitted orders (client_order_id + coinbase order id + payload sizing fields)
+  - final status / fills if available
+  - run status (COMPLETED / SKIPPED / HALTED / ERROR)
+  - skip_reason/skip_detail or halt_reason when applicable
+- Logs must clearly show planned vs submitted orders and include run_id.
+- Slack alerts must reflect live execution when not dry-run.
+
+TESTING (required)
+Add/update unit tests with mocks:
+- Assert in dry-run: no submit-order method is called (no POST).
+- Assert BUY payload uses quote_size and includes client_order_id.
+- Assert SELL payload uses base_size and includes client_order_id.
+- Assert idempotency: if an order exists in SQLite for (run_id, product_id, side), submit-order is not called.
+- Assert unresolved order timeout triggers halt logic (halt flag set + recorded).
+
+DELIVERABLE
+- pytest passes
+- `python -m redline.main run --dry-run` still works and never calls trading endpoints
+- `python -m redline.main run` submits live orders only when REDLINE_DRY_RUN=false and all safety gates pass
+Stop after Phase 2 is complete and briefly summarize what you changed.

@@ -1,0 +1,99 @@
+CLI TEST OVERRIDE FLAGS (FINAL REVISION: per-asset flags + forced gross allocation + safe SQLite migration)
+
+I need you to add SAFE CLI test override flags to the existing redline repo so I can force BUY/SELL scenarios for live execution testing. Keep changes minimal. Do NOT change strategy math or default behavior unless overrides are explicitly enabled.
+
+GOAL
+Add CLI flags to `python -m redline.main run` that can override the computed risk-on/off signals (and optionally sizing) for a single run, ONLY when explicitly allowed. This is for testing live order submission (buys/sells) without waiting for market conditions.
+
+SAFETY REQUIREMENTS (STRICT)
+1) Overrides must be DISABLED by default.
+2) Overrides must only be accepted if BOTH of these are true:
+   - env var `REDLINE_ALLOW_TEST_OVERRIDES=true`
+   - env var `REDLINE_ENV=dev`
+   If override flags are provided without meeting BOTH conditions:
+   - exit non-zero with a clear error message
+   - MUST NOT place any orders
+3) When overrides are active, the bot must:
+   - log a structured event `TEST_OVERRIDE_ACTIVE` (include override values)
+   - include the override info in the Slack message (if enabled)
+   - persist the override info into SQLite for that run (see persistence rule below)
+
+PERSISTENCE RULE (avoid dangerous migrations)
+- Persist overrides on the run record.
+- If new columns are needed, upgrade SQLite safely:
+  - use ALTER TABLE ... ADD COLUMN (no dropping tables)
+  - guard with PRAGMA table_info checks (or try/except) so it is idempotent and does not fail on subsequent boots
+- Never delete or rebuild existing tables/data.
+
+CLI FLAGS TO ADD
+Add these flags to the existing `run` command:
+
+1) Per-asset signal overrides (explicit and independent)
+- `--force-btc-signal` with choices: COMPUTED (default), ON, OFF
+- `--force-eth-signal` with choices: COMPUTED (default), ON, OFF
+
+Behavior:
+- If ON or OFF, bypass the SMA200 result for that specific asset and hardcode the risk signal for that asset.
+- If COMPUTED, use the normal SMA200-based signal for that asset.
+- This override applies ONLY for the current run.
+
+2) Optional sizing override for controlled test trades
+- `--force-gross-usd <float>` (optional; default: unset)
+
+Behavior of --force-gross-usd:
+- This does NOT change balances or equity. It only overrides the *desired gross notional exposure* used for target sizing for this run.
+- Still enforce all existing constraints:
+  - max gross notional <= 1.0 * equity
+  - max per-asset <= 0.70 * equity
+  - min trade threshold $50
+  - product min size/increments and rounding
+
+Allocation rule when --force-gross-usd is set (make deterministic; avoid vol weighting complexity):
+- Determine final risk-on set after applying signal overrides.
+- If BOTH BTC and ETH are risk-on: split the forced gross 50/50 between BTC and ETH.
+- If only one asset is risk-on: allocate 100% of forced gross to that asset.
+- If none are risk-on: targets are 0 (flat).
+- When --force-gross-usd is NOT set: keep the existing vol-target sizing logic unchanged.
+
+EXECUTION EXPECTATIONS
+With these flags I should be able to:
+- Force a BUY (example): `--force-eth-signal ON --force-btc-signal OFF --force-gross-usd 100`
+  (Assuming I have available USD, this should plan/submit a small ETH buy above the $50 threshold.)
+- Force a SELL to flat (example): `--force-btc-signal OFF --force-eth-signal OFF`
+  (If I hold any BTC/ETH, this should plan/submit sells to reach 0 targets.)
+
+LOGGING / DB FIELDS (minimum)
+- On each run, store in the run record:
+  - force_btc_signal (COMPUTED/ON/OFF)
+  - force_eth_signal (COMPUTED/ON/OFF)
+  - force_gross_usd (nullable)
+- Include these in Slack summary and `status` output when present.
+
+TESTING (REQUIRED)
+Add unit tests with mocks that verify:
+
+1) Gating:
+- If override flags are passed but REDLINE_ALLOW_TEST_OVERRIDES=true AND REDLINE_ENV=dev are NOT both set,
+  the command exits non-zero and does not call any order submission methods.
+
+2) Signal override behavior:
+- With gating enabled, `--force-btc-signal OFF --force-eth-signal OFF` results in risk-off for both, targets 0, and plans sells when positions are non-zero.
+- With gating enabled, `--force-eth-signal ON --force-btc-signal OFF` results in ETH risk-on and BTC risk-off, and plans a buy for ETH when USD is available.
+
+3) Forced gross allocation rule:
+- With gating enabled and --force-gross-usd 100 and BOTH assets risk-on, targets allocate $50 BTC and $50 ETH (before caps/rounding).
+- With only one asset risk-on, targets allocate $100 to that asset (before caps/rounding).
+
+4) Observability:
+- A `TEST_OVERRIDE_ACTIVE` log event is emitted when overrides are active (assert via captured logs).
+- The override fields are persisted to SQLite for the run.
+
+CONSTRAINTS
+- Do NOT alter default behavior when flags are not provided.
+- Do NOT add new services or long-running processes.
+- Keep code style consistent with existing CLI and config modules.
+
+DELIVERABLE
+- `pytest` passes
+- Provide a short summary of changes (files touched + how to use the flags).
+Stop after implementing this feature.
