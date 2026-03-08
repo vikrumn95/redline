@@ -31,6 +31,18 @@ from redline.timeutil import utcnow_iso
 PRODUCTS = ["BTC-USD", "ETH-USD"]
 
 
+def _parse_bool_flag(value: str) -> bool:
+    """Parse CLI boolean values for flags that optionally accept true/false."""
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(
+        f"invalid boolean value: {value!r} (expected true/false)"
+    )
+
+
 def _skip_reason(
     signals: dict[str, bool],
     target_notionals: dict[str, float],
@@ -124,7 +136,7 @@ def _compute_forced_targets(
 def cmd_run(args: argparse.Namespace, cfg: Config) -> None:
     run_id = uuid.uuid4().hex[:8]
     logger = RunLogger(run_id, cfg.log_level)
-    dry_run = args.dry_run or cfg.dry_run
+    dry_run = cfg.dry_run if args.dry_run is None else args.dry_run
 
     logger.info("run_start", dry_run=dry_run, env=cfg.env, mock=cfg.mock)
 
@@ -604,7 +616,15 @@ def main() -> None:
     sub = parser.add_subparsers(dest="command", required=True)
 
     run_p = sub.add_parser("run", help="Run a rebalance cycle")
-    run_p.add_argument("--dry-run", action="store_true", default=False)
+    run_p.add_argument(
+        "--dry-run",
+        nargs="?",
+        const=True,
+        default=None,
+        type=_parse_bool_flag,
+        metavar="{true,false}",
+        help="Dry-run mode. Accepts no value (true) or an explicit true/false.",
+    )
     run_p.add_argument("--mock", action="store_true", default=False, help="Use synthetic data (no Coinbase credentials needed)")
     _signal_choices = ["COMPUTED", "ON", "OFF"]
     run_p.add_argument(
