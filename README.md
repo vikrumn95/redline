@@ -218,7 +218,7 @@ python -m redline.main reset-halt \
 
 ### Recommended first live trade
 
-Use test override flags in dev to force a small, deterministic trade before relying on market signals:
+Use test override flags in dev to force a small, deterministic trade before relying on market signals. See [`docs/mvp/TESTING.md`](docs/mvp/TESTING.md) for full flag semantics, examples, and a step-by-step runbook.
 
 ```bash
 # Force a $100 ETH buy (requires $100+ USD available)
