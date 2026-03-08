@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -40,7 +41,19 @@ def load_config(env_file: str | Path | None = ".env") -> Config:
     coinbase_api_secret = os.environ.get("COINBASE_API_SECRET", "")
     mock = _bool(os.environ.get("REDLINE_MOCK", "false")) or not coinbase_api_key
 
-    db_path = Path(os.environ.get("REDLINE_DB_PATH", "./data/redline.db"))
+    env = os.environ.get("REDLINE_ENV", "dev")
+
+    if env == "prod" and mock:
+        print("Error: mock mode is not allowed when REDLINE_ENV=prod", file=sys.stderr)
+        sys.exit(1)
+
+    if mock:
+        default_db = "./data/redline-mock.db"
+    elif env == "dev":
+        default_db = "./data/redline-dev.db"
+    else:
+        default_db = "./data/redline.db"
+    db_path = Path(os.environ.get("REDLINE_DB_PATH", default_db))
 
     return Config(
         coinbase_api_key=coinbase_api_key,
@@ -49,7 +62,7 @@ def load_config(env_file: str | Path | None = ".env") -> Config:
         dry_run=_bool(os.environ.get("REDLINE_DRY_RUN", "true")),
         db_path=db_path,
         log_level=os.environ.get("REDLINE_LOG_LEVEL", "INFO"),
-        env=os.environ.get("REDLINE_ENV", "dev"),
+        env=env,
         rebalance_time_utc=os.environ.get("REDLINE_REBALANCE_TIME_UTC", "00:00"),
         target_vol=float(os.environ.get("REDLINE_TARGET_VOL", "0.25")),
         max_drawdown=float(os.environ.get("REDLINE_MAX_DRAWDOWN", "0.30")),

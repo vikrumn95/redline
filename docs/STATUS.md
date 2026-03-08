@@ -30,7 +30,7 @@
 | Post-trade reconciliation | ❌ not implemented | `reconcile_check()` exists in `core/reconcile.py` but is never called from the run loop |
 | Stale price data check | ❌ not implemented | Bot uses last daily candle close with no timestamp staleness guard |
 | VM deployment (GCP + systemd) | 📄 documented | Systemd unit + timer defined in README; not yet verified in production |
-| Mock mode (synthetic data) | ✅ implemented | Auto-enabled when `COINBASE_API_KEY` is empty; fixed random seed |
+| Mock mode (synthetic data) | ✅ implemented | Auto-enabled when `COINBASE_API_KEY` is empty; writes to `redline-mock.db`; blocked in prod |
 
 ---
 
@@ -92,9 +92,9 @@ pytest
 | `COINBASE_API_SECRET` | _(empty)_ | EC private key PEM; escape newlines as `\n` |
 | `COINBASE_PORTFOLIO_ID` | _(unset)_ | Scope API to one portfolio (recommended) |
 | `REDLINE_DRY_RUN` | `true` | `false` required for live order submission |
-| `REDLINE_MOCK` | `false` | `true` → synthetic data, no Coinbase calls |
+| `REDLINE_MOCK` | `false` | `true` → synthetic data, no Coinbase calls; **blocked when `REDLINE_ENV=prod`** |
 | `REDLINE_ENV` | `dev` | Must be `dev` for override flags; set to `prod` in production |
-| `REDLINE_DB_PATH` | `./data/redline.db` | SQLite file path; parent dir auto-created |
+| `REDLINE_DB_PATH` | _(env-dependent)_ | Default: `redline-mock.db` (mock), `redline-dev.db` (dev), `redline.db` (prod/other) |
 | `REDLINE_ALLOW_TEST_OVERRIDES` | `false` | Must be `true` + `REDLINE_ENV=dev` to accept `--force-*` flags |
 | `REDLINE_SLACK_WEBHOOK_URL` | _(unset)_ | Slack Incoming Webhook; unset = log-only mode |
 | `REDLINE_MIN_TRADE_USD` | `50` | Orders below this notional are skipped |

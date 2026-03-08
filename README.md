@@ -61,9 +61,9 @@ All configuration is via environment variables (loaded from `.env` if present).
 | `COINBASE_API_SECRET` | For live trading | _(empty)_ | EC private key PEM; escape newlines as `\n` in the file |
 | `COINBASE_PORTFOLIO_ID` | No | _(empty)_ | Restrict API calls to this portfolio UUID; recommended when key is shared |
 | `REDLINE_DRY_RUN` | No | `true` | `true` = plan orders but never submit; `false` = live mode |
-| `REDLINE_MOCK` | No | `false` | `true` = synthetic candles and balances, no Coinbase calls; auto-enabled when `COINBASE_API_KEY` is empty |
-| `REDLINE_ENV` | No | `dev` | Deployment tag. Must be `dev` for test override flags to be accepted |
-| `REDLINE_DB_PATH` | No | `./data/redline.db` | Path to the SQLite file; parent directory is created automatically |
+| `REDLINE_MOCK` | No | `false` | `true` = synthetic candles and balances, no Coinbase calls; auto-enabled when `COINBASE_API_KEY` is empty; **blocked when `REDLINE_ENV=prod`** (exits 1) |
+| `REDLINE_ENV` | No | `dev` | Deployment tag. Must be `dev` for test override flags to be accepted. Set to `prod` in production |
+| `REDLINE_DB_PATH` | No | _(env-dependent)_ | Path to the SQLite file; parent directory is created automatically. Default: `redline-mock.db` when mock, `redline-dev.db` when `env=dev`, `redline.db` otherwise |
 | `REDLINE_LOG_LEVEL` | No | `INFO` | `DEBUG` \| `INFO` \| `WARNING` \| `ERROR` |
 | `REDLINE_REBALANCE_TIME_UTC` | No | `00:00` | Target rebalance time (stored in config; not enforced by the run command) |
 | `REDLINE_TARGET_VOL` | No | `0.25` | Annualised portfolio volatility target (0.25 = 25%) |
@@ -96,6 +96,10 @@ Enabled by `REDLINE_DRY_RUN=true` (the default) or the `--dry-run` flag.
 - **Candles**: 260 daily candles per product, fixed random seed (BTC seed=42, ETH seed=43)
 - **Balances**: $10,000 USD, 0 BTC, 0 ETH
 - **Order submission**: returns a mock order ID; polling returns `FILLED` immediately
+
+Mock mode writes to a separate database (`redline-mock.db` by default) to prevent fake equity and order data from contaminating dev or prod state.
+
+**Mock mode is blocked when `REDLINE_ENV=prod`** — the process exits 1 immediately. This prevents accidental synthetic runs against the production database.
 
 Use mock mode for local development and CI. It exercises the full code path without credentials.
 
